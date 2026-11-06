@@ -1,0 +1,42 @@
+name: Publish VoiceBalance 1.0.0
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voicebalance-v1.0.0
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Test and package the release
+        run: |
+          git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" source
+          git -C source checkout --detach "$GITHUB_SHA"
+          node --test source/tests/processor.test.cjs
+          git -C source archive --format=zip --output="$PWD/VoiceBalance-1.0.0.zip" "$GITHUB_SHA" README.md LICENSE voiceBalance.web
+      - name: Publish v1.0.0
+        run: |
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create v1.0.0 VoiceBalance-1.0.0.zip \
+            --target "$GITHUB_SHA" --title "VoiceBalance 1.0.0" --latest --notes-file - <<'NOTES'
+          Первый стабильный релиз VoiceBalance для Vesktop и Vencord в браузере.
+
+          - Выравнивание громкости каждого собеседника с защитой от резких пиков.
+          - Общее и индивидуальное шумоподавление RNNoise.
+          - При сбое обработки сохраняется звук. Состояние фильтра освобождается при отключении.
+          - Архив содержит плагин, встроенную модель, лицензии и инструкцию.
+          NOTES
