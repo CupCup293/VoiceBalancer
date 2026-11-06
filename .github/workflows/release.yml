@@ -1,4 +1,4 @@
-name: Publish VoiceBalance 1.0.1
+name: Publish VoiceBalance 1.2.0
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: voicebalance-v1.0.1
+  group: voicebalance-v1.2.0
 
 jobs:
   release:
@@ -25,17 +25,17 @@ jobs:
           git clone --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" source
           git -C source checkout --detach "$GITHUB_SHA"
           node --test source/tests/processor.test.cjs
-          git -C source archive --format=zip --output="$PWD/VoiceBalance-1.0.1.zip" "$GITHUB_SHA" README.md LICENSE voiceBalance.web
-      - name: Publish v1.0.1
+          git -C source archive --format=zip --output="$PWD/VoiceBalance-1.2.0.zip" "$GITHUB_SHA" README.md LICENSE voiceBalance.web
+      - name: Publish v1.2.0
         run: |
-          if gh release view v1.0.1 >/dev/null 2>&1; then
+          if gh release view v1.2.0 >/dev/null 2>&1; then
             exit 0
           fi
-          gh release create v1.0.1 VoiceBalance-1.0.1.zip \
-            --target "$GITHUB_SHA" --title "VoiceBalance 1.0.1" --latest --notes-file - <<'NOTES'
-          Обновление баланса громкости для Vesktop и Vencord в браузере.
+          gh release create v1.2.0 VoiceBalance-1.2.0.zip \
+            --target "$GITHUB_SHA" --title "VoiceBalance 1.2.0" --latest --notes-file - <<'NOTES'
+          Новые настройки VoiceBalance для Vesktop и Vencord в браузере.
 
-          - Пики на границе аудиоблоков приглушаются плавнее.
-          - Тихая речь быстрее восстанавливает громкость после короткого громкого звука.
-          - При замене дорожки сохраняется общий аудиоконтекст.
+          - Мягкое, обычное и усиленное выравнивание громкости.
+          - Возможность выключить выравнивание отдельно от шумоподавления.
+          - Индивидуальная поправка целевой громкости собеседника на ±3 или ±6 дБ.
           NOTES

@@ -104,3 +104,20 @@ test("quiet speech recovers promptly after a short loud burst", () => {
     const after = rmsDb(output.subarray(burstEnd + 0.2 * sampleRate, burstEnd + 0.3 * sampleRate));
     assert.ok(before - after < 8, `Gain recovered to ${after.toFixed(1)} dB from ${before.toFixed(1)} dB`);
 });
+
+test("balance strength and target can change during playback", () => {
+    const { processor } = createProcessor(0);
+    const speech = Float32Array.from({ length: 144000 }, (_, i) => 0.014 * Math.sin(i * Math.PI / 100));
+    const measure = (strength, target = -19) => {
+        processor.port.onmessage({ data: { mode: 0, target, strength } });
+        return rmsDb(render(processor, speech).subarray(120000));
+    };
+
+    const soft = measure(0.55);
+    const normal = measure(1);
+    const strong = measure(1.35);
+    assert.ok(normal > soft + 4);
+    assert.ok(strong > normal + 2);
+    assert.ok(measure(1.35, -25) < strong - 3);
+    assert.ok(Math.abs(measure(0) - rmsDb(speech)) < 0.1);
+});

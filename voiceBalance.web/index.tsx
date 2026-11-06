@@ -72,6 +72,17 @@ const settings = definePluginSettings({
         stickToMarkers: true,
         onChange: updateProcessors,
     },
+    balanceStrength: {
+        description: "Сила автоматического выравнивания голоса.",
+        type: OptionType.SELECT,
+        options: [
+            { label: "Выключено", value: 0 },
+            { label: "Мягкое", value: 0.55 },
+            { label: "Обычное", value: 1, default: true },
+            { label: "Усиленное", value: 1.35 },
+        ],
+        onChange: updateProcessors,
+    },
     noiseSuppression: {
         description: "Шумоподавление для всех собеседников без индивидуальной настройки.",
         type: OptionType.BOOLEAN,
@@ -87,7 +98,10 @@ const settings = definePluginSettings({
         ],
         onChange: updateProcessors,
     },
-}).withPrivateSettings<{ userNoiseSuppression?: Record<string, boolean>; }>();
+}).withPrivateSettings<{
+    userNoiseSuppression?: Record<string, boolean>;
+    userLevelOffset?: Record<string, number>;
+}>();
 
 const overrideOptions = [
     { key: "default", label: "Как в общих настройках", value: undefined },
@@ -95,12 +109,12 @@ const overrideOptions = [
     { key: "off", label: "Выключено", value: false },
 ];
 
-const addNoiseMenu: NavContextMenuPatchCallback = (children, { user } = {}) => {
+const addVoiceBalanceMenu: NavContextMenuPatchCallback = (children, { user } = {}) => {
     const userId: string | undefined = user?.id;
     if (!userId || userId === UserStore.getCurrentUser()?.id) return;
 
     const override = settings.store.userNoiseSuppression?.[userId];
-    const menu = (
+    const noiseMenu = (
         <Menu.MenuItem id="voice-balance-noise" label="Шумоподавление VoiceBalance">
             {overrideOptions.map(({ key, label, value }) => (
                 <Menu.MenuRadioItem
@@ -122,9 +136,32 @@ const addNoiseMenu: NavContextMenuPatchCallback = (children, { user } = {}) => {
             ))}
         </Menu.MenuItem>
     );
+    const selectedOffset = settings.store.userLevelOffset?.[userId] ?? 0;
+    const levelMenu = (
+        <Menu.MenuItem id="voice-balance-level" label="Громкость VoiceBalance">
+            {[-6, -3, 0, 3, 6].map(offset => (
+                <Menu.MenuRadioItem
+                    key={offset}
+                    id={`voice-balance-level-${offset}`}
+                    group="voice-balance-level"
+                    label={offset === 0 ? "Общий целевой уровень" : `${offset > 0 ? "+" : ""}${offset} дБ`}
+                    checked={offset === selectedOffset}
+                    action={() => {
+                        const offsets = { ...settings.store.userLevelOffset };
+                        if (offset === 0) delete offsets[userId];
+                        else offsets[userId] = offset;
+                        settings.store.userLevelOffset = offsets;
+                        for (const graph of graphs.values()) {
+                            if (graph.userId === userId) updateProcessor(graph);
+                        }
+                    }}
+                />
+            ))}
+        </Menu.MenuItem>
+    );
     const volumeGroup = findGroupChildrenByChildId(["user-volume", "volume"], children);
-    if (volumeGroup) volumeGroup.push(menu);
-    else children.push(<Menu.MenuGroup>{menu}</Menu.MenuGroup>);
+    if (volumeGroup) volumeGroup.push(noiseMenu, levelMenu);
+    else children.push(<Menu.MenuGroup>{noiseMenu}{levelMenu}</Menu.MenuGroup>);
 };
 
 const logger = new Logger("VoiceBalance");
@@ -143,8 +180,14 @@ function processorSettings(userId?: string) {
         ? Math.max(MIN_TARGET_DB, Math.min(MAX_TARGET_DB, savedTarget))
         : DEFAULT_TARGET_DB;
     const override = userId ? settings.store.userNoiseSuppression?.[userId] : undefined;
+    const offset = userId ? settings.store.userLevelOffset?.[userId] : undefined;
+    const strength = settings.store.balanceStrength;
     const enabled = override ?? settings.store.noiseSuppression;
-    return { target, mode: enabled ? settings.store.isolation === 2 ? 2 : 1 : 0 };
+    return {
+        target: target + (offset === -6 || offset === -3 || offset === 3 || offset === 6 ? offset : 0),
+        mode: enabled ? settings.store.isolation === 2 ? 2 : 1 : 0,
+        strength: strength === 0 || strength === 0.55 || strength === 1.35 ? strength : 1,
+    };
 }
 
 function updateProcessors() {
@@ -310,10 +353,10 @@ function closeUnusedResamplingContext() {
 }
 
 function adjustLevels() {
-    const { target } = processorSettings();
     for (const graph of graphs.values()) {
         const { context } = graph;
         if (graph.usingWorklet || context.state !== "running" || graph.element.srcObject !== graph.destination.stream) continue;
+        const { target, strength } = processorSettings(graph.userId);
 
         const now = context.currentTime;
         const elapsed = Math.min(0.1, now - graph.lastSampleAt);
@@ -326,12 +369,15 @@ function adjustLevels() {
 
         let desiredDb = 0;
         let response = 0.3;
-        if (inputDb >= SPEECH_FLOOR_DB) {
+        if (strength === 0) {
+            response = 0.07;
+        } else if (inputDb >= SPEECH_FLOOR_DB) {
             graph.lastSpeechAt = now;
             // Taper the maximum boost near the noise floor.
-            const boostLimit = Math.min(MAX_BOOST_DB, 1.5 * (inputDb - SPEECH_FLOOR_DB));
-            desiredDb = Math.max(MIN_TARGET_DB, Math.min(boostLimit, target - inputDb));
-            response = desiredDb < graph.correctionDb ? 0.035 : 0.28;
+            const boostLimit = Math.min(MAX_BOOST_DB * strength, 1.5 * (inputDb - SPEECH_FLOOR_DB) * Math.max(1, strength));
+            const correction = (target - inputDb) * Math.min(1, strength);
+            desiredDb = Math.max(MIN_TARGET_DB, Math.min(boostLimit, correction));
+            response = (desiredDb < graph.correctionDb ? 0.035 : 0.28) / strength;
         } else if (now - graph.lastSpeechAt < 0.3) {
             continue;
         }
@@ -373,10 +419,10 @@ function detach(output: VoiceOutput, restore: boolean) {
 
 export default definePlugin({
     name: "VoiceBalance",
-    description: "Версия 1.0.1. Выравнивает громкость собеседников. Шумоподавление можно настраивать глобально и отдельно для каждого. Для Vesktop и Vencord в браузере.",
+    description: "Версия 1.2.0. Выравнивает громкость собеседников. Шумоподавление можно настраивать глобально и отдельно для каждого. Для Vesktop и Vencord в браузере.",
     authors: [{ name: "Codex", id: 0n }],
     settings,
-    contextMenus: { "user-context": addNoiseMenu },
+    contextMenus: { "user-context": addVoiceBalanceMenu },
     patches: [
         {
             find: "BaseWebRTCConnection.createOutput: ignoring track being torn down",

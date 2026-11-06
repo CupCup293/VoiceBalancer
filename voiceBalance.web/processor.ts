@@ -54,10 +54,11 @@ const PEAK_LOOKAHEAD_DECAY = Math.exp(-1 / 100);
 const PEAK_RELEASE_DECAY = Math.exp(-1 / 3200);
 
 class VoiceBalance extends AudioWorkletProcessor {
-    constructor({ processorOptions: { target, mode } }) {
+    constructor({ processorOptions: { target, mode, strength = 1 } }) {
         super();
         this.target = target;
         this.mode = mode;
+        this.strength = strength;
         this.input = new Float32Array(FRAME);
         this.previousInput = new Float32Array(FRAME);
         this.output = new Float32Array(FRAME);
@@ -92,6 +93,7 @@ class VoiceBalance extends AudioWorkletProcessor {
             }
             this.target = data.target;
             this.mode = data.mode;
+            this.strength = data.strength ?? 1;
             if (this.mode && !this.noiseRequested && !this.noiseFailed) {
                 this.noiseRequested = true;
                 if (kernelLoading) void this.startNoiseFilter();
@@ -233,9 +235,10 @@ class VoiceBalance extends AudioWorkletProcessor {
         let desiredDb = this.gainDb;
         if (speech) {
             const reference = this.speechDb ?? level;
-            const boost = Math.max(0, Math.min(22, (reference + 56) * 1.15));
+            const boost = Math.max(0, Math.min(22 * this.strength, (reference + 56) * 1.15 * Math.max(1, this.strength)));
             const levelForGain = Math.max(reference, level - 4);
-            desiredDb = Math.max(-36, Math.min(boost, this.target - levelForGain));
+            const correction = (this.target - levelForGain) * Math.min(1, this.strength);
+            desiredDb = Math.max(-36, Math.min(boost, correction));
             if (this.onsetFrames > 0) {
                 desiredDb = Math.min(desiredDb, this.gainDb);
                 this.onsetFrames--;
@@ -250,6 +253,12 @@ class VoiceBalance extends AudioWorkletProcessor {
             speed = 0.022;
             if (desiredDb < this.gainDb) speed = 0.28;
             else if (this.gainDb < 0) speed = 0.075;
+        }
+        if (this.strength === 0) {
+            desiredDb = 0;
+            speed = 0.15;
+        } else {
+            speed *= this.strength;
         }
         this.gainDb += (desiredDb - this.gainDb) * speed;
         const gain = 10 ** (this.gainDb / 20) * this.gate;
