@@ -365,7 +365,9 @@ function detach(output: VoiceOutput, restore: boolean) {
     graph.limiter.disconnect();
     for (const track of graph.destination.stream.getTracks()) track.stop();
 
-    closeUnusedResamplingContext();
+    // Track replacement detaches and reattaches synchronously. Keep the shared context
+    // available until the replacement has had a chance to reuse it.
+    queueMicrotask(closeUnusedResamplingContext);
     syncFallbackTimer();
 }
 

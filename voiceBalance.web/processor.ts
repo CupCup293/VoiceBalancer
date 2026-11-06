@@ -5,6 +5,7 @@ export const processorName = "vencord-voice-balance-1";
 // This module runs in the audio rendering thread, outside the Vencord renderer.
 export const processorSource = String.raw`
 const FRAME = 480;
+const LOOKAHEAD = 96;
 const PCM_SCALE = 32768;
 const KNEE = 0.68;
 const CEILING = 0.891;
@@ -60,7 +61,8 @@ class VoiceBalance extends AudioWorkletProcessor {
         this.input = new Float32Array(FRAME);
         this.previousInput = new Float32Array(FRAME);
         this.output = new Float32Array(FRAME);
-        this.peaks = new Float32Array(FRAME);
+        this.limiterInput = new Float32Array(FRAME + LOOKAHEAD);
+        this.peaks = new Float32Array(FRAME + LOOKAHEAD);
         this.offset = 0;
         this.frames = 0;
         this.gainDb = 0;
@@ -68,6 +70,7 @@ class VoiceBalance extends AudioWorkletProcessor {
         this.peakEnvelope = 0;
         this.speechDb = null;
         this.pauseFrames = 400;
+        this.onsetFrames = 0;
         this.hold = 0;
         this.gate = 1;
         this.mix = 0;
@@ -217,45 +220,56 @@ class VoiceBalance extends AudioWorkletProcessor {
         this.gate += (gateTarget - this.gate) * (open ? 0.80 : 0.065);
 
         const speech = level > -55 && (!filtering || this.mix < 0.5 || this.hold > 0 || audibleOnset);
-        const onset = speech && this.pauseFrames > 18;
+        if (speech && this.pauseFrames > 18) this.onsetFrames = 4;
         this.pauseFrames = speech ? 0 : this.pauseFrames + 1;
-        if (speech) {
+        if (speech && (!filtering || this.mix < 0.5 || confidence >= threshold)) {
             this.speechDb ??= level;
-            // Track louder speech promptly, but retain the reference through gaps and quiet syllables.
-            const follow = level > this.speechDb ? 0.16 : 0.022;
-            this.speechDb += (level - this.speechDb) * follow;
+            // An isolated loud frame should hit the fast gain control without resetting the
+            // reference used for the quieter syllables that follow it.
+            const difference = level - this.speechDb;
+            this.speechDb += difference > 0 ? Math.min(difference, 6) * 0.16 : difference * 0.022;
         }
 
         let desiredDb = this.gainDb;
         if (speech) {
-            const boost = Math.max(0, Math.min(22, (this.speechDb + 56) * 1.15));
-            const levelForGain = Math.max(this.speechDb, level - 4);
+            const reference = this.speechDb ?? level;
+            const boost = Math.max(0, Math.min(22, (reference + 56) * 1.15));
+            const levelForGain = Math.max(reference, level - 4);
             desiredDb = Math.max(-36, Math.min(boost, this.target - levelForGain));
-            if (onset) desiredDb = Math.min(desiredDb, this.gainDb);
+            if (this.onsetFrames > 0) {
+                desiredDb = Math.min(desiredDb, this.gainDb);
+                this.onsetFrames--;
+            }
         } else if (this.pauseFrames > 110) {
             desiredDb = 0;
             if (this.pauseFrames > 400) this.speechDb = null;
         }
 
-        const speed = speech ? (desiredDb < this.gainDb ? 0.28 : 0.022) : 0.007;
+        let speed = 0.007;
+        if (speech) {
+            speed = 0.022;
+            if (desiredDb < this.gainDb) speed = 0.28;
+            else if (this.gainDb < 0) speed = 0.075;
+        }
         this.gainDb += (desiredDb - this.gainDb) * speed;
         const gain = 10 ** (this.gainDb / 20) * this.gate;
         const gainStep = (gain - this.outputGain) / FRAME;
 
-        // Limit individual peaks with lookahead and a continuous release. A single click should
-        // not turn down the entire 10 ms frame or reset the gain at a frame boundary.
+        // Hold back 2 ms so the limiter can see peaks on the other side of a frame boundary.
+        for (let i = 0; i < FRAME; i++) {
+            this.limiterInput[LOOKAHEAD + i] = this.input[i] * (this.outputGain + (i + 1) * gainStep);
+        }
         let peak = 0;
-        for (let i = FRAME - 1; i >= 0; i--) {
-            const sample = this.input[i] * (this.outputGain + (i + 1) * gainStep);
-            this.input[i] = sample;
-            peak = Math.max(Math.abs(sample), peak * PEAK_LOOKAHEAD_DECAY);
+        for (let i = this.limiterInput.length - 1; i >= 0; i--) {
+            peak = Math.max(Math.abs(this.limiterInput[i]), peak * PEAK_LOOKAHEAD_DECAY);
             this.peaks[i] = peak;
         }
         for (let i = 0; i < FRAME; i++) {
             this.peakEnvelope = Math.max(this.peaks[i], this.peakEnvelope * PEAK_RELEASE_DECAY);
             const attenuation = this.peakEnvelope > 0.82 ? 0.82 / this.peakEnvelope : 1;
-            this.output[i] = limit(this.input[i] * attenuation);
+            this.output[i] = limit(this.limiterInput[i] * attenuation);
         }
+        this.limiterInput.copyWithin(0, FRAME);
         this.outputGain = gain;
     }
 

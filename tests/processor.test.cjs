@@ -72,3 +72,35 @@ test("a failing RNNoise kernel leaves the dry balance working", async () => {
     assert.equal(processor.state, 0);
     processor.dispose();
 });
+
+function rmsDb(samples) {
+    return 10 * Math.log10(samples.reduce((power, sample) => power + sample * sample, 0) / samples.length);
+}
+
+test("the limiter smoothly anticipates a peak at a frame boundary", () => {
+    const { processor } = createProcessor(0);
+    const input = new Float32Array(144000).fill(0.03);
+    input[96000] = 1;
+    const output = render(processor, input);
+
+    const peak = output.findIndex(sample => sample > 0.7);
+    assert.ok(peak > 96000);
+    assert.ok(output[peak] < 0.83);
+    assert.ok(Math.abs(output[peak - 1] - output[peak + 1]) < 0.004);
+    assert.ok(output[peak - 50] > output[peak - 1]);
+});
+
+test("quiet speech recovers promptly after a short loud burst", () => {
+    const { processor } = createProcessor(0);
+    const sampleRate = 48000;
+    const burst = 2 * sampleRate;
+    const burstEnd = burst + 1440;
+    const input = Float32Array.from({ length: 3 * sampleRate }, (_, i) => {
+        const amplitude = i >= burst && i < burstEnd ? 0.9 : 0.03;
+        return amplitude * Math.sin(i * Math.PI / 100);
+    });
+    const output = render(processor, input);
+    const before = rmsDb(output.subarray(burst - 0.2 * sampleRate, burst - 0.1 * sampleRate));
+    const after = rmsDb(output.subarray(burstEnd + 0.2 * sampleRate, burstEnd + 0.3 * sampleRate));
+    assert.ok(before - after < 8, `Gain recovered to ${after.toFixed(1)} dB from ${before.toFixed(1)} dB`);
+});
