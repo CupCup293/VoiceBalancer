@@ -23,6 +23,7 @@ interface VoiceOutput {
 interface VoiceGraph {
     userId: string;
     context: AudioContext;
+    stream: MediaStream;
     track: MediaStreamTrack;
     element: HTMLAudioElement;
     source: MediaStreamAudioSourceNode;
@@ -41,6 +42,7 @@ interface VoiceGraph {
     lastSpeechAt: number;
     worklet?: AudioWorkletNode;
     workletTimeout?: number;
+    failWorklet?: (error: unknown) => void;
     usingWorklet: boolean;
     routeReady: boolean;
 }
@@ -190,14 +192,34 @@ function loadModel() {
 
 function closeProcessor(graph: VoiceGraph) {
     window.clearTimeout(graph.workletTimeout);
+    graph.workletTimeout = undefined;
+    graph.failWorklet = undefined;
     const node = graph.worklet;
     graph.worklet = undefined;
     if (!node) return;
     node.onprocessorerror = null;
-    node.port.onmessage = null;
+    // Give the processor a chance to free its per-speaker WASM state before closing the port.
+    const finish = () => {
+        window.clearTimeout(deadline);
+        node.port.onmessage = null;
+        node.port.close();
+    };
+    const deadline = window.setTimeout(finish, 1000);
+    node.port.onmessage = ({ data }) => {
+        if (data === "closed") finish();
+    };
     node.port.postMessage("close");
-    node.port.close();
     node.disconnect();
+}
+
+function watchWorklet(graph: VoiceGraph) {
+    const fail = graph.failWorklet;
+    if (!fail || graph.context.state !== "running") {
+        window.clearTimeout(graph.workletTimeout);
+        graph.workletTimeout = undefined;
+    } else {
+        graph.workletTimeout ??= window.setTimeout(() => fail(new Error("AudioWorklet did not start")), 3000);
+    }
 }
 
 async function enableProcessor(output: VoiceOutput, graph: VoiceGraph) {
@@ -207,6 +229,7 @@ async function enableProcessor(output: VoiceOutput, graph: VoiceGraph) {
         if (graph.usingWorklet) {
             graph.lowpass.disconnect();
             graph.lowpass.connect(graph.meter);
+            graph.limiter.connect(graph.destination);
             graph.usingWorklet = false;
         }
         closeProcessor(graph);
@@ -219,11 +242,13 @@ async function enableProcessor(output: VoiceOutput, graph: VoiceGraph) {
         }
     };
 
+    graph.failWorklet = fallback;
+    watchWorklet(graph);
     try {
         if (context.sampleRate !== 48000) throw new Error("RNNoise requires 48 kHz");
         if (!context.audioWorklet) throw new Error("AudioWorklet is unavailable");
         await loadProcessor(context);
-        if (graphs.get(output) !== graph) return;
+        if (graphs.get(output) !== graph || graph.routeReady) return;
 
         const node = new AudioWorkletNode(context, processorName, {
             channelCount: 1,
@@ -236,14 +261,17 @@ async function enableProcessor(output: VoiceOutput, graph: VoiceGraph) {
         node.port.onmessage = ({ data }) => {
             if (graph.worklet !== node) return;
             if (data === "ready") {
-                window.clearTimeout(graph.workletTimeout);
                 graph.lowpass.disconnect();
+                graph.limiter.disconnect();
                 graph.usingWorklet = true;
                 graph.lowpass.connect(node).connect(graph.destination);
                 updateProcessor(graph);
             } else if (data === "primed") {
+                graph.failWorklet = undefined;
+                watchWorklet(graph);
                 graph.routeReady = true;
                 graph.updateRoute();
+                syncFallbackTimer();
             } else if (data === "noise-request") {
                 try {
                     node.port.postMessage({ wasm: loadModel() });
@@ -254,7 +282,6 @@ async function enableProcessor(output: VoiceOutput, graph: VoiceGraph) {
                 reportModelError(data);
             }
         };
-        graph.workletTimeout = window.setTimeout(() => fallback(new Error("AudioWorklet did not respond")), 3000);
     } catch (error) {
         fallback(error);
     }
@@ -270,6 +297,15 @@ function processingContext(original: AudioContext) {
         return resamplingContext;
     } catch {
         return original;
+    }
+}
+
+function closeUnusedResamplingContext() {
+    const context = resamplingContext;
+    if (!context || [...graphs.values()].some(graph => graph.context === context)) return;
+    resamplingContext = undefined;
+    if (context.state !== "closed") {
+        void context.close().catch(error => logger.warn("Could not close the voice processing context", error));
     }
 }
 
@@ -311,11 +347,12 @@ function detach(output: VoiceOutput, restore: boolean) {
 
     graphs.delete(output);
     graph.context.removeEventListener("statechange", graph.updateRoute);
+    output.audioContext.removeEventListener("statechange", graph.updateRoute);
     graph.track.removeEventListener("ended", graph.onTrackEnded);
 
     if (restore && graph.element.srcObject === graph.destination.stream) {
-        graph.element.srcObject = output.stream;
-        void output.playAudio(graph.element);
+        graph.element.srcObject = graph.stream;
+        void output.playAudio(graph.element).catch(error => logger.warn("Could not restore voice playback", error));
     }
 
     graph.source.disconnect();
@@ -328,6 +365,7 @@ function detach(output: VoiceOutput, restore: boolean) {
     graph.limiter.disconnect();
     for (const track of graph.destination.stream.getTracks()) track.stop();
 
+    closeUnusedResamplingContext();
     syncFallbackTimer();
 }
 
@@ -371,10 +409,6 @@ export default definePlugin({
     stop() {
         active = false;
         for (const output of graphs.keys()) detach(output, true);
-        if (resamplingContext) {
-            void resamplingContext.close();
-            resamplingContext = undefined;
-        }
     },
 
     attach(output: VoiceOutput) {
@@ -382,7 +416,8 @@ export default definePlugin({
 
         const { audioElement, stream } = output;
         const track = stream.getAudioTracks().find(track => track.readyState === "live");
-        if (track && graphs.get(output)?.track === track) return;
+        const previous = graphs.get(output);
+        if (previous && previous.track === track && previous.element === audioElement && previous.stream === stream) return;
 
         detach(output, true);
         if (!track || !audioElement || output.audioContext.state === "closed") return;
@@ -413,18 +448,23 @@ export default definePlugin({
             const destination = audioContext.createMediaStreamDestination();
 
             const updateRoute = () => {
+                if (output.audioContext.state === "closed" || audioContext.state === "closed") {
+                    detach(output, true);
+                    return;
+                }
+                watchWorklet(graph);
                 const playback = graph.routeReady && audioContext.state === "running" ? destination.stream : stream;
                 if (audioElement.srcObject === playback) return;
                 if (audioElement.srcObject !== stream && audioElement.srcObject !== destination.stream) return;
 
                 // Keep Discord's audio element, including its mute, volume and sink settings.
                 audioElement.srcObject = playback;
-                void output.playAudio(audioElement);
+                void output.playAudio(audioElement).catch(error => logger.warn("Could not start voice playback", error));
             };
-            const onTrackEnded = () => detach(output, true);
+            const onTrackEnded = () => this.attach(output);
 
             const graph: VoiceGraph = {
-                userId: output.id, context: audioContext, track, element: audioElement, source, highpass, lowpass,
+                userId: output.id, context: audioContext, stream, track, element: audioElement, source, highpass, lowpass,
                 meter, gain, compressor, limiter, destination,
                 samples: new Float32Array(meter.fftSize),
                 updateRoute, onTrackEnded, correctionDb: 0,
@@ -437,18 +477,20 @@ export default definePlugin({
 
             source.connect(highpass).connect(lowpass).connect(meter).connect(gain).connect(compressor).connect(limiter).connect(destination);
             audioContext.addEventListener("statechange", updateRoute);
+            if (output.audioContext !== audioContext) output.audioContext.addEventListener("statechange", updateRoute);
             track.addEventListener("ended", onTrackEnded);
             updateRoute();
             void enableProcessor(output, graph);
         } catch (error) {
             detach(output, true);
+            closeUnusedResamplingContext();
             logger.warn("Could not route incoming voice audio", error);
         }
     },
 
     removeIfMissing(output: VoiceOutput) {
         const graph = graphs.get(output);
-        if (graph && !output.stream.getAudioTracks().includes(graph.track)) detach(output, true);
+        if (graph && !output.stream.getAudioTracks().includes(graph.track)) this.attach(output);
     },
 
     detach(output: VoiceOutput) {

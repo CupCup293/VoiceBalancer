@@ -74,9 +74,11 @@ class VoiceBalance extends AudioWorkletProcessor {
         this.warmup = 0;
         this.previousProbability = 0;
         this.noiseRequested = false;
+        this.noiseFailed = false;
         this.closed = false;
 
         this.port.onmessage = ({ data }) => {
+            if (this.closed) return;
             if (data === "close") {
                 this.dispose();
                 return;
@@ -87,7 +89,7 @@ class VoiceBalance extends AudioWorkletProcessor {
             }
             this.target = data.target;
             this.mode = data.mode;
-            if (this.mode && !this.noiseRequested) {
+            if (this.mode && !this.noiseRequested && !this.noiseFailed) {
                 this.noiseRequested = true;
                 if (kernelLoading) void this.startNoiseFilter();
                 else this.port.postMessage("noise-request");
@@ -101,13 +103,16 @@ class VoiceBalance extends AudioWorkletProcessor {
             kernelLoading ??= WebAssembly.compile(wasm).then(loadKernel);
             this.rn = await kernelLoading;
             if (this.closed) return;
+            if (!this.mode) {
+                this.noiseRequested = false;
+                return;
+            }
             this.state = this.rn.create(0);
             this.buffer = this.rn.malloc(FRAME * 4);
             if (!this.state || !this.buffer) throw new Error("RNNoise allocation failed");
             this.samples = new Float32Array(this.rn.memory.buffer, this.buffer, FRAME);
         } catch {
-            this.releaseNoiseFilter();
-            this.port.postMessage("noise-error");
+            if (!this.closed) this.failNoiseFilter();
         }
     }
 
@@ -116,13 +121,24 @@ class VoiceBalance extends AudioWorkletProcessor {
         if (this.state) this.rn.destroy(this.state);
         this.buffer = 0;
         this.state = 0;
+        this.noiseRequested = false;
+        this.warmup = 0;
+        this.hold = 0;
+        this.previousProbability = 0;
+    }
+
+    failNoiseFilter() {
+        this.noiseFailed = true;
+        this.releaseNoiseFilter();
+        this.mix = 0;
+        this.port.postMessage("noise-error");
     }
 
     dispose() {
         if (this.closed) return;
         this.closed = true;
         this.releaseNoiseFilter();
-        this.port.close();
+        this.port.postMessage("closed");
     }
 
     process(inputs, outputs) {
@@ -131,7 +147,8 @@ class VoiceBalance extends AudioWorkletProcessor {
         const output = outputs[0][0];
         for (let i = 0; i < output.length; i++) {
             output[i] = this.output[this.offset];
-            this.input[this.offset++] = input?.[i] ?? 0;
+            const sample = input?.[i];
+            this.input[this.offset++] = Number.isFinite(sample) ? sample : 0;
             if (this.offset === FRAME) {
                 this.processFrame();
                 this.offset = 0;
@@ -142,19 +159,27 @@ class VoiceBalance extends AudioWorkletProcessor {
 
     processFrame() {
         if (++this.frames === 3) this.port.postMessage("primed");
-        const filtering = Boolean(this.state && this.mode);
-        const oldMix = this.mix;
+        let filtering = Boolean(this.state && this.mode);
+        let oldMix = this.mix;
         let probability = 0;
         let wetSamples;
         if (filtering || oldMix > 0) {
-            this.refreshBuffer();
-            for (let i = 0; i < FRAME; i++) this.samples[i] = this.input[i] * PCM_SCALE;
-            probability = this.rn.process(this.state, this.buffer, this.buffer);
-            this.refreshBuffer();
-            wetSamples = this.samples;
-            this.warmup = Math.min(3, this.warmup + 1);
-        } else {
-            this.warmup = 0;
+            try {
+                this.refreshBuffer();
+                for (let i = 0; i < FRAME; i++) this.samples[i] = this.input[i] * PCM_SCALE;
+                probability = this.rn.process(this.state, this.buffer, this.buffer);
+                if (!Number.isFinite(probability)) throw new Error("Invalid RNNoise voice probability");
+                this.refreshBuffer();
+                wetSamples = this.samples;
+                this.warmup = Math.min(3, this.warmup + 1);
+            } catch {
+                this.failNoiseFilter();
+                filtering = false;
+                oldMix = 0;
+                probability = 0;
+            }
+        } else if (this.state) {
+            this.releaseNoiseFilter();
         }
 
         // RNNoise overlaps two frames. Delay the dry path by the same frame so toggling does not
@@ -167,7 +192,8 @@ class VoiceBalance extends AudioWorkletProcessor {
         for (let i = 0; i < FRAME; i++) {
             mix += mixStep;
             const dry = this.previousInput[i];
-            const sample = wetSamples ? dry + (wetSamples[i] / PCM_SCALE - dry) * mix : dry;
+            const wet = wetSamples && wetSamples[i];
+            const sample = wetSamples && Number.isFinite(wet) ? dry + (wet / PCM_SCALE - dry) * mix : dry;
             this.previousInput[i] = this.input[i];
             this.input[i] = sample;
             power += sample * sample;
