@@ -102,7 +102,7 @@ test("quiet speech recovers promptly after a short loud burst", () => {
     const output = render(processor, input);
     const before = rmsDb(output.subarray(burst - 0.2 * sampleRate, burst - 0.1 * sampleRate));
     const after = rmsDb(output.subarray(burstEnd + 0.2 * sampleRate, burstEnd + 0.3 * sampleRate));
-    assert.ok(before - after < 8, `Gain recovered to ${after.toFixed(1)} dB from ${before.toFixed(1)} dB`);
+    assert.ok(before - after < 4, `Gain recovered to ${after.toFixed(1)} dB from ${before.toFixed(1)} dB`);
 });
 
 test("balance strength and target can change during playback", () => {
@@ -120,4 +120,19 @@ test("balance strength and target can change during playback", () => {
     assert.ok(strong > normal + 2);
     assert.ok(measure(1.35, -25) < strong - 3);
     assert.ok(Math.abs(measure(0) - rmsDb(speech)) < 0.1);
+});
+
+test("steady broadband noise stays at its input level and quiet voice still gains level", () => {
+    const { processor } = createProcessor(0);
+    let seed = 419351;
+    const noise = Float32Array.from({ length: 96000 }, () => {
+        seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+        return (seed / 2 ** 32 - 0.5) * 0.045;
+    });
+    const background = render(processor, noise).subarray(72000);
+    assert.ok(Math.abs(rmsDb(background) - rmsDb(noise)) < 0.5);
+
+    const voice = Float32Array.from({ length: 96000 }, (_, i) => 0.017 * Math.sin(i * Math.PI / 100));
+    const balanced = render(processor, voice).subarray(72000);
+    assert.ok(rmsDb(balanced) > rmsDb(voice) + 6);
 });

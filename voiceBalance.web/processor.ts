@@ -67,6 +67,9 @@ class VoiceBalance extends AudioWorkletProcessor {
         this.offset = 0;
         this.frames = 0;
         this.gainDb = 0;
+        this.transientDb = 0;
+        this.noiseLevelDb = null;
+        this.stationaryFrames = 0;
         this.outputGain = 1;
         this.peakEnvelope = 0;
         this.speechDb = null;
@@ -194,6 +197,8 @@ class VoiceBalance extends AudioWorkletProcessor {
         const mixStep = (this.mix - oldMix) / FRAME;
         let mix = oldMix;
         let power = 0;
+        let differencePower = 0;
+        let previousSample = 0;
         for (let i = 0; i < FRAME; i++) {
             mix += mixStep;
             const dry = this.previousInput[i];
@@ -202,6 +207,9 @@ class VoiceBalance extends AudioWorkletProcessor {
             this.previousInput[i] = this.input[i];
             this.input[i] = sample;
             power += sample * sample;
+            const difference = sample - previousSample;
+            differencePower += difference * difference;
+            previousSample = sample;
         }
         const level = 10 * Math.log10(Math.max(1e-12, power / FRAME));
         const confidence = Math.max(probability, this.previousProbability);
@@ -221,10 +229,23 @@ class VoiceBalance extends AudioWorkletProcessor {
         const gateTarget = open ? 1 : 1 + (idleGate(this.mode) - 1) * this.mix;
         this.gate += (gateTarget - this.gate) * (open ? 0.80 : 0.065);
 
-        const speech = level > -55 && (!filtering || this.mix < 0.5 || this.hold > 0 || audibleOnset);
+        // Without a settled RNNoise model, track steady broadband sound separately. Preserve
+        // the signal but prevent the leveler from treating constant hiss as a quiet speaker.
+        const useVoiceDetection = filtering && this.mix >= 0.5;
+        const broadband = power > 0 && differencePower > power * 0.30;
+        this.noiseLevelDb ??= level;
+        const noiseDelta = level - this.noiseLevelDb;
+        if (!useVoiceDetection && broadband && level > -65 && Math.abs(noiseDelta) < 1.6) {
+            this.stationaryFrames = Math.min(40, this.stationaryFrames + 1);
+        } else {
+            this.stationaryFrames = Math.max(0, this.stationaryFrames - 4);
+        }
+        this.noiseLevelDb += noiseDelta * 0.15;
+        const background = this.stationaryFrames >= 25;
+        const speech = level > -55 && !background && (!useVoiceDetection || this.hold > 0 || audibleOnset);
         if (speech && this.pauseFrames > 18) this.onsetFrames = 4;
         this.pauseFrames = speech ? 0 : this.pauseFrames + 1;
-        if (speech && (!filtering || this.mix < 0.5 || confidence >= threshold)) {
+        if (speech && (!useVoiceDetection || confidence >= threshold)) {
             this.speechDb ??= level;
             // An isolated loud frame should hit the fast gain control without resetting the
             // reference used for the quieter syllables that follow it.
@@ -236,19 +257,18 @@ class VoiceBalance extends AudioWorkletProcessor {
         if (speech) {
             const reference = this.speechDb ?? level;
             const boost = Math.max(0, Math.min(22 * this.strength, (reference + 56) * 1.15 * Math.max(1, this.strength)));
-            const levelForGain = Math.max(reference, level - 4);
-            const correction = (this.target - levelForGain) * Math.min(1, this.strength);
+            const correction = (this.target - reference) * Math.min(1, this.strength);
             desiredDb = Math.max(-36, Math.min(boost, correction));
             if (this.onsetFrames > 0) {
                 desiredDb = Math.min(desiredDb, this.gainDb);
                 this.onsetFrames--;
             }
-        } else if (this.pauseFrames > 110) {
+        } else if (background || this.pauseFrames > 110) {
             desiredDb = 0;
             if (this.pauseFrames > 400) this.speechDb = null;
         }
 
-        let speed = 0.007;
+        let speed = background ? 0.12 : 0.007;
         if (speech) {
             speed = 0.022;
             if (desiredDb < this.gainDb) speed = 0.28;
@@ -261,7 +281,13 @@ class VoiceBalance extends AudioWorkletProcessor {
             speed *= this.strength;
         }
         this.gainDb += (desiredDb - this.gainDb) * speed;
-        const gain = 10 ** (this.gainDb / 20) * this.gate;
+        // A separate fast compressor catches loud syllables without carrying their attenuation
+        // into the speaker gain. The existing lookahead limiter still catches individual peaks.
+        const overshoot = speech ? Math.max(0, level + this.gainDb - this.target - 4) : 0;
+        const transientTarget = -Math.min(18, overshoot * 0.8 * Math.min(1, this.strength));
+        const transientSpeed = transientTarget < this.transientDb ? 0.8 : 0.24;
+        this.transientDb += (transientTarget - this.transientDb) * transientSpeed;
+        const gain = 10 ** ((this.gainDb + this.transientDb) / 20) * this.gate;
         const gainStep = (gain - this.outputGain) / FRAME;
 
         // Hold back 2 ms so the limiter can see peaks on the other side of a frame boundary.
