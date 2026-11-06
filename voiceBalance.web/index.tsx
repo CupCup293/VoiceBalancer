@@ -373,7 +373,7 @@ function detach(output: VoiceOutput, restore: boolean) {
 
 export default definePlugin({
     name: "VoiceBalance",
-    description: "Версия 1.0. Выравнивает громкость собеседников. Шумоподавление можно настраивать глобально и отдельно для каждого. Для Vesktop и Vencord в браузере.",
+    description: "Версия 1.0.1. Выравнивает громкость собеседников. Шумоподавление можно настраивать глобально и отдельно для каждого. Для Vesktop и Vencord в браузере.",
     authors: [{ name: "Codex", id: 0n }],
     settings,
     contextMenus: { "user-context": addNoiseMenu },
